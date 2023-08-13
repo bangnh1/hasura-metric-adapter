@@ -67,8 +67,6 @@ pub struct HttpLogDetailOperation {
 
 #[derive(Deserialize)]
 pub struct HttpLogDetails {
-    #[serde(rename = "request_id")]
-    pub request_id: String,
     #[serde(rename = "operation")]
     pub operation: HttpLogDetailOperation,
     pub http_info: HttpLogDetailHttpInfo,

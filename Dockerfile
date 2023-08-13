@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM rust:1.69 as build
-ARG TARGETARCH
+FROM rust:1.69 as build
+ARG TARGETARCH=amd64
 
 RUN echo "export PATH=/usr/local/cargo/bin:$PATH" >> /etc/profile
 WORKDIR /app
@@ -23,8 +23,8 @@ RUN touch src/main.rs && cargo build --release --target=$(cat /.platform)
 RUN mkdir -p /release/$TARGETARCH
 RUN cp ./target/$(cat /.platform)/release/metrics /release/$TARGETARCH/metrics
 
-FROM gcr.io/distroless/cc-debian11
-ARG TARGETARCH
+FROM debian:11-slim
+ARG TARGETARCH=amd64
 COPY --from=build /release/$TARGETARCH/metrics /
 
 CMD ["/metrics"]
