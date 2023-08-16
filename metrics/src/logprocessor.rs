@@ -1,8 +1,10 @@
 use log::warn;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{from_str, from_value};
 use crate::Telemetry;
+use moka::sync::Cache;
+use std::collections::HashMap;
 
 
 #[derive(Deserialize)]
@@ -67,15 +69,64 @@ pub struct HttpLogDetailOperation {
 
 #[derive(Deserialize)]
 pub struct HttpLogDetails {
-    #[serde(rename = "request_id")]
-    pub request_id: String,
+    // TODO: Comment this out for support hasura v1
+    // #[serde(rename = "request_id")]
+    // pub request_id: String,
     #[serde(rename = "operation")]
     pub operation: HttpLogDetailOperation,
     pub http_info: HttpLogDetailHttpInfo,
 }
 
-async fn handle_http_log(log: &BaseLog, metric_obj: &Telemetry) {
-    let detail_result = from_value::<HttpLogDetails>(log.detail.clone());
+#[derive(Serialize, Deserialize)]
+pub struct QueryLogDetail {
+    #[serde(rename = "request_id")]
+    pub request_id: String,
+    #[serde(rename = "query")]
+    pub query: QueryLogDetailQuery,
+    #[serde(rename = "generated_sql")]
+    pub generated_sql: HashMap<String, QueryLogDetailGeneratedSQL>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct QueryLogDetailQuery {
+    #[serde(rename = "operationName")]
+    pub operation_name: String,
+    #[serde(rename = "query")]
+    pub query: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct QueryLogDetailGeneratedSQLString {
+    pub data: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct QueryLogDetailGeneratedSQL {
+    #[serde(rename = "prepared_arguments")]
+    pub prepared_arguments: Vec<String>,
+    #[serde(rename = "query")]
+    pub query: String,
+}
+
+async fn handle_query_log(log: &BaseLog, cache: &Cache<std::string::String, std::string::String>) {
+    let detail_result: Result<QueryLogDetail, serde_json::Error> = from_value::<QueryLogDetail>(log.detail.clone());
+    match detail_result {
+        Ok(query_log_detail) => {
+            let generated_sql = query_log_detail.generated_sql;
+            for v in generated_sql {
+                let value = v.1.query;
+                let request_id = query_log_detail.request_id.clone();
+                cache.insert(request_id,value);
+            }
+        }
+        Err(e) => {
+            eprintln!("Invalid Query log detail: {}", e);
+        }
+    };
+}
+
+async fn handle_http_log(log: &BaseLog, metric_obj: &Telemetry,cache: &Cache<std::string::String, std::string::String>) {
+    let detail_result: Result<HttpLogDetails, serde_json::Error> = from_value::<HttpLogDetails>(log.detail.clone());
     match detail_result {
         Ok(http) => {
             metric_obj.REQUEST_COUNTER
@@ -84,21 +135,40 @@ async fn handle_http_log(log: &BaseLog, metric_obj: &Telemetry) {
                     format!("{}", http.http_info.status).as_str(),
                 ])
                 .inc();
+        let request_id = http.operation.request_id;
+        let error = http.operation.error.map_or("".to_string(), |v| v.code);
+
+        if let Some(cached_result) = cache.get(&request_id) {
+            let cached = cached_result.clone();
+            // let error = http.operation.error.map_or("".to_string(), |v| v.code);s
+                if let Some(exec_time) = http.operation.query_execution_time {
+                    metric_obj.QUERY_EXECUTION_TIMES
+                        .with_label_values(&[cached.as_str(), error.as_str()])
+                        .observe(exec_time);
+                }
 
             if let Some(query) = http.operation.query {
-                let error = http.operation.error.map_or("".to_string(), |v| v.code);
-
                 let operation = query.operation_name.unwrap_or("".to_string());
                 metric_obj.REQUEST_QUERY_COUNTER
                     .with_label_values(&[operation.as_str(), error.as_str()])
                     .inc();
-
-                if let Some(exec_time) = http.operation.query_execution_time {
-                    metric_obj.QUERY_EXECUTION_TIMES
-                        .with_label_values(&[operation.as_str(), error.as_str()])
-                        .observe(exec_time);
-                }
             }
+        }
+    
+            // if let Some(query) = http.operation.query {
+            //     let error = http.operation.error.map_or("".to_string(), |v| v.code);
+
+            //     let operation = query.operation_name.unwrap_or("".to_string());
+            //     metric_obj.REQUEST_QUERY_COUNTER
+            //         .with_label_values(&[operation.as_str(), error.as_str()])
+            //         .inc();
+
+            //     if let Some(exec_time) = http.operation.query_execution_time {
+            //         metric_obj.QUERY_EXECUTION_TIMES
+            //             .with_label_values(&[operation.as_str(), error.as_str()])
+            //             .observe(exec_time);
+            //     }
+            // }
         }
         Err(e) => {
             eprintln!("Invalid HTTP log detail: {}", e);
@@ -145,7 +215,7 @@ pub struct WebSocketDetail {
 }
 
 async fn handle_websocket_log(log: &BaseLog, metric_obj: &Telemetry) {
-    let detail_result = from_value::<WebSocketDetail>(log.detail.clone());
+    let detail_result: Result<WebSocketDetail, serde_json::Error> = from_value::<WebSocketDetail>(log.detail.clone());
     match detail_result {
         Ok(http) => {
             match &http.event.event_type as &str {
@@ -184,8 +254,7 @@ async fn handle_websocket_log(log: &BaseLog, metric_obj: &Telemetry) {
     };
 }
 
-pub async fn log_processor(logline: &String, metric_obj: &Telemetry) {
-    //println!("{}", logline);
+pub async fn log_processor(logline: &String, metric_obj: &Telemetry, cache: &Cache<std::string::String, std::string::String>) {
     metric_obj.LOG_LINES_COUNTER_TOTAL.inc();
     let log_result = from_str::<BaseLog>(logline);
     match log_result {
@@ -195,10 +264,13 @@ pub async fn log_processor(logline: &String, metric_obj: &Telemetry) {
                 .inc();
             match &log.logtype as &str {
                 "http-log" => {
-                    handle_http_log(&log,metric_obj).await;
+                    handle_http_log(&log,metric_obj,&cache).await;
                 }
                 "websocket-log" => {
                     handle_websocket_log(&log,metric_obj).await;
+                }
+                "query-log" => {
+                    handle_query_log(&log, &cache).await;
                 }
                 _ => {}
             };

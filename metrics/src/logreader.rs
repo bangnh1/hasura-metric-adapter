@@ -8,6 +8,7 @@ use tokio::{
 };
 use std::io::Result;
 use std::time::Duration;
+use moka::sync::Cache;
 
 
 use crate::{logprocessor, Telemetry};
@@ -55,6 +56,15 @@ pub async fn read_file(log_file: &str, metric_obj: &Telemetry, sleep_time: u64, 
 async fn process_file(metric_obj: &Telemetry, file: &File, sleep_time: u64, mut termination_rx: watch::Receiver<()>) -> Result<bool> {
     let reader = BufReader::new(file.try_clone().await?);
     let mut lines = reader.lines();
+    let cache: Cache<String, String> = Cache::builder()
+        // Time to live (TTL): 30 minutes
+        .time_to_live(Duration::from_secs(30 * 60))
+        // Time to idle (TTI):  5 minutes
+        .time_to_idle(Duration::from_secs( 5 * 60))
+        // This cache will hold up to 32MiB of values.
+        .max_capacity(32 * 1024 * 1024)
+        // Create the cache.
+        .build();
 
     loop {
         tokio::select! {
@@ -68,7 +78,7 @@ async fn process_file(metric_obj: &Telemetry, file: &File, sleep_time: u64, mut 
 
                 if let Some(line) = next_line? {
                     debug!("Reading line from logfile");
-                    logprocessor::log_processor(&line, metric_obj).await;
+                    logprocessor::log_processor(&line, metric_obj, &cache).await;
                 } else {
                     time::sleep(Duration::from_millis(sleep_time)).await;
                 }
